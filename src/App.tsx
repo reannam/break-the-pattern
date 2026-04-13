@@ -371,10 +371,10 @@ export default function App() {
     setError('')
 
     try {
-      const response = await fetch('/rewrite', {
+      const response = await fetch('/api/v1.0/rewrite', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, mode }),
+        body: JSON.stringify({ email: text, mode: mode.toLowerCase() }),
       })
 
       if (!response.ok) {

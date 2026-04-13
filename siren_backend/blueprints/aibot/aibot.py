@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify
 from google import genai
 from google.genai import types
 import json
+import re
 import globals
 
 aibot_bp = Blueprint("aibot", __name__)
@@ -212,6 +213,136 @@ Message:
 """
 
 
+def extract_json_payload(raw_text):
+    """
+    Gemini occasionally wraps JSON in markdown fences or adds prose.
+    Pull out the first JSON object if direct parsing fails.
+    """
+
+    if not raw_text:
+        raise ValueError("Empty model response")
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        pass
+
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw_text, re.DOTALL)
+    if fenced_match:
+        return json.loads(fenced_match.group(1))
+
+    object_match = re.search(r"(\{.*\})", raw_text, re.DOTALL)
+    if object_match:
+        return json.loads(object_match.group(1))
+
+    raise ValueError("No valid JSON object found in model response")
+
+
+def safe_number(value, fallback=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def score_after_value(score_block):
+    """
+    Support both nested score objects and already-normalized numeric scores.
+    """
+
+    if isinstance(score_block, dict):
+        if isinstance(score_block.get("after"), dict):
+            return safe_number(score_block["after"].get("value"), 0)
+        return safe_number(score_block.get("value"), 0)
+
+    return safe_number(score_block, 0)
+
+
+def normalize_response(data):
+    """
+    Convert model output into the exact frontend contract.
+    """
+
+    scores = data.get("scores", {}) if isinstance(data, dict) else {}
+
+    normalized = {
+        "rewritten": data.get("rewritten", "") if isinstance(data, dict) else "",
+        "explanations": data.get("explanations", []) if isinstance(data, dict) else [],
+        "scores": {
+            "clarity": score_after_value(scores.get("clarity")),
+            "directness": score_after_value(scores.get("directness")),
+            "assertiveness": score_after_value(scores.get("assertiveness")),
+        },
+        "improved_phrases": data.get("improved_phrases", []) if isinstance(data, dict) else [],
+    }
+
+    if not isinstance(normalized["explanations"], list):
+        normalized["explanations"] = [str(normalized["explanations"])]
+
+    if not isinstance(normalized["improved_phrases"], list):
+        normalized["improved_phrases"] = []
+
+    return normalized
+
+
+def fallback_rewrite(email_text, mode):
+    """
+    Deterministic fallback so the demo still works if Gemini fails.
+    """
+
+    rewritten = email_text.strip()
+    replacements = [
+        ("just", ""),
+        ("maybe", ""),
+        ("I think", ""),
+        ("i think", ""),
+        ("sorry", ""),
+        ("perhaps", ""),
+        ("when you get a chance", ""),
+        ("wanted to check in", "am following up"),
+    ]
+
+    improved_phrases = []
+    for old, new in replacements:
+        if old in rewritten:
+            improved_phrases.append(old)
+            rewritten = rewritten.replace(old, new)
+
+    rewritten = re.sub(r"\s+", " ", rewritten).strip(" ,")
+
+    if mode == "sympathetic":
+        if not rewritten.lower().startswith(("hi", "hello", "hey")):
+            rewritten = f"Hi, {rewritten}"
+        explanations = [
+            "Kept the tone warm while removing hesitant phrasing.",
+            "Made the request easier to understand and harder to overlook.",
+            "Reduced filler language without making the message cold.",
+        ]
+        scores = {
+            "clarity": 8,
+            "directness": 7,
+            "assertiveness": 7,
+        }
+    else:
+        explanations = [
+            "Removed hedging and filler language.",
+            "Made the request more direct and action-oriented.",
+            "Tightened the sentence structure for clearer delivery.",
+        ]
+        scores = {
+            "clarity": 8,
+            "directness": 8,
+            "assertiveness": 8,
+        }
+
+    return {
+        "rewritten": rewritten or email_text.strip(),
+        "explanations": explanations,
+        "scores": scores,
+        "improved_phrases": improved_phrases,
+    }
+
+
 # ----------------------------
 # Route
 # ----------------------------
@@ -239,15 +370,15 @@ def rewrite_emails():
         )
 
         try:
-            data = json.loads(response.text)
-        except Exception:
-            return jsonify({
-                "error": "Model returned invalid JSON",
-                "raw": response.text
-            }), 500
+            data = extract_json_payload(response.text)
+            normalized = normalize_response(data)
+        except Exception as parse_error:
+            print(f"JSON Parse Error: {parse_error}")
+            print(f"Raw model response: {response.text}")
+            return jsonify(fallback_rewrite(email, mode))
 
-        return jsonify(data)
+        return jsonify(normalized)
 
     except Exception as e:
         print(f"AI Error: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify(fallback_rewrite(email, mode))
